@@ -60,6 +60,7 @@
     "timezone": "+08:00",
     "body_fetch_limit_per_run": 60,
     "title_template": "{customer}｜{action}",
+    "_note_title_template": "Used only by the mechanical fallback (suggest/apply --input). A judgment 'create' decision keeps the agent's title exactly as written.",
     "state_dir": "state",
     "runs_dir": "runs",
     "secrets_file": "secrets.json",
