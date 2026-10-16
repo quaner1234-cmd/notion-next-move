@@ -26,8 +26,13 @@ def read(path):
             "tasks": {},
             "pending": [],
             "runs": [],
+            "judgmentQueue": [],
+            "appliedJudgments": {},
         }
-    return json.loads(path.read_text(encoding="utf-8"))
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state.setdefault("judgmentQueue", [])
+    state.setdefault("appliedJudgments", {})
+    return state
 
 
 def write(path, state):
@@ -150,6 +155,74 @@ def add_pending(state, entry):
     entry = {**entry, "queuedAt": _now(), "status": entry.get("status", "needs_review")}
     state["pending"].append(entry)
     return entry
+
+
+def queue_judgment_messages(state, messages):
+    """Add freshly archived messages to the judgment queue (dedup by id).
+
+    Only messages with a verified evidence locator enter the queue: an item
+    without one could not be judged safely, so it stays out and is reported
+    by the scan instead.
+    """
+    queued = {normalize_id(item.get("message_id")) for item in state["judgmentQueue"]}
+    added = []
+    for message in messages:
+        ident = normalize_id(message.get("message_id"))
+        if not ident or ident in queued:
+            continue
+        if not message.get("locator") or not message.get("customer_key"):
+            continue
+        if message.get("error") or message.get("pending_review"):
+            continue
+        state["judgmentQueue"].append({
+            "message_id": message.get("message_id"),
+            "customer_key": message.get("customer_key"),
+            "customer_display": message.get("customer_display")
+                                or message.get("customer_key"),
+            "direction": message.get("direction"),
+            "date": message.get("date"),
+            "from": message.get("from"),
+            "subject": message.get("subject"),
+            "body_preview": message.get("body_preview"),
+            "body_truncated_in_packet": message.get("body_truncated_in_packet"),
+            "attachments": message.get("attachments") or [],
+            "locator": message.get("locator"),
+            "in_reply_to": message.get("in_reply_to"),
+            "references": message.get("references"),
+            "queuedAt": _now(),
+        })
+        queued.add(ident)
+        added.append(message.get("message_id"))
+    return added
+
+
+def mark_judged(state, message_ids, request_id, by="judgment"):
+    """Remove judged messages from the queue and record which request handled them.
+
+    Messages referenced by a decision that actually succeeded leave the queue;
+    a failed decision leaves its message queued so the next request shows it
+    again (the queue is the retry mechanism).
+    """
+    wanted = {normalize_id(mid) for mid in message_ids if mid}
+    if not wanted:
+        return []
+    removed = []
+    remaining = []
+    for item in state["judgmentQueue"]:
+        if normalize_id(item.get("message_id")) in wanted:
+            removed.append(item.get("message_id"))
+        else:
+            remaining.append(item)
+    state["judgmentQueue"] = remaining
+    if removed:
+        state["appliedJudgments"][request_id] = {
+            "at": _now(), "by": by, "message_ids": removed,
+        }
+    return removed
+
+
+def judgment_already_applied(state, request_id):
+    return bool(state.get("appliedJudgments", {}).get(request_id))
 
 
 def resolve_pending(state, message_id):

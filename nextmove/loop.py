@@ -518,6 +518,7 @@ def process_message(config, mailbox, client, state, run_dir, commit, role, folde
 
     customer = config_module.customers_by_key(config).get(customer_key) or {}
     page_id = str(customer.get("page_id") or "").replace("-", "")
+    packet["customer_display"] = customer.get("display_name") or customer_key
     if not page_id:
         packet["pending_review"] = True
         packet["resolution"] = f"customer {customer_key} has no page_id"
@@ -694,8 +695,182 @@ def find_open_reply_task(state, customer_key, message_id):
     return None
 
 
+def build_judgment_request(config, packet, state):
+    """Assemble the document a user's agent judges (the input side).
+
+    Contains exactly what a judgement needs and nothing more: the new messages
+    with previews + evidence locators, the customer's open tasks, and the
+    rules. It is written to ``state/judgment-request.json`` by the caller.
+    """
+    from . import judgment as judgment_module
+    offset = offset_from(config["policy"]["timezone"])
+    customers = config_module.customers_by_key(config)
+    messages = []
+    for message in packet.get("new_messages", []):
+        if message.get("error") or message.get("pending_review"):
+            continue
+        key = message.get("customer_key")
+        if not key:
+            continue
+        display = (customers.get(key) or {}).get("display_name") or key
+        messages.append({
+            "message_id": message.get("message_id"),
+            "customer_key": key,
+            "customer_display": display,
+            "direction": message.get("direction"),
+            "date": message.get("date"),
+            "from": message.get("from"),
+            "subject": message.get("subject"),
+            "body_preview": message.get("body_preview"),
+            "body_truncated_in_packet": message.get("body_truncated_in_packet"),
+            "attachments": message.get("attachments") or [],
+            "locator": message.get("locator"),
+            "thread_references": [x for x in (
+                plan_module.message_id_list(message.get("in_reply_to")) +
+                plan_module.message_id_list(message.get("references"))) if x],
+        })
+    open_tasks = []
+    for identity, record in state.get("tasks", {}).items():
+        if record.get("status") in ("done", "archived", "完成", "已归档"):
+            continue
+        open_tasks.append({
+            "identity": identity,
+            "title": record.get("title"),
+            "customer_key": record.get("customer_key"),
+            "message_id": record.get("message_id"),
+            "source_locator": record.get("source_locator"),
+            "created_at": record.get("updatedAt"),
+        })
+    request = {
+        "kind": judgment_module.REQUEST_KIND,
+        "generatedAt": now_iso(offset),
+        "account": config["mailbox"]["account"],
+        "customers": [{"key": c.get("key"), "display_name": c.get("display_name")}
+                      for c in config.get("customers", [])],
+        "messages": messages,
+        "open_tasks": sorted(open_tasks, key=lambda x: x["identity"] or ""),
+        "holdovers": packet.get("pending_recheck", []),
+        "instructions": judgment_module.build_instructions(config),
+    }
+    request["requestId"] = judgment_module.request_id(request)
+    return request
+
+
+def apply_judgment(config, client, validation, state, commit):
+    """Persist validated judgment decisions (create/complete/append/hold).
+
+    Only decisions marked valid by ``judgment.validate`` reach this function;
+    every write is the same machinery the mechanical path uses (dedupe,
+    readback, ledger), so the safety properties are identical.
+    """
+    data_source_id = plan_module.task_data_source_id(config)
+    schema, status_options = tasks_module.discover_properties(client, data_source_id)
+    mapping, kinds, problems = tasks_module.resolve_mapping(config, schema)
+    if problems:
+        raise LoopError("property mapping problems: " + "; ".join(problems))
+    tasks_module.check_status_option(config, "todo", schema, mapping, status_options)
+    tasks_module.check_status_option(config, "done", schema, mapping, status_options)
+    existing = tasks_module.load_existing(client, data_source_id)
+    known_keys = {record.get("identity") for record in state.get("tasks", {}).values()
+                  if record.get("identity")}
+    customers = config_module.customers_by_key(config)
+    template = config["policy"].get("title_template") or "{customer}｜{action}"
+    todo_label = tasks_module.status_value(config, "todo")
+    results = {"created": [], "completed": [], "appended": [], "held": [],
+               "rejected": [], "outcomes": [], "commit": bool(commit),
+               "existing_task_count": len(existing)}
+    for entry in validation.get("decisions", []):
+        if entry.get("status") != "valid":
+            results["rejected"].append({"index": entry.get("index"),
+                                        "decision": entry.get("decision"),
+                                        "problems": entry.get("problems")})
+            continue
+        payload = entry.get("payload") or {}
+        kind = payload.get("decision")
+        if kind == "create":
+            message = payload.get("message") or {}
+            display = (customers.get(payload.get("customer_key")) or {}).get("display_name") \
+                or payload.get("customer_key")
+            candidate = {
+                "identity": plan_module.task_identity(payload["customer_key"],
+                                                      payload.get("message_id")),
+                "customer_key": payload["customer_key"],
+                "customer_display": display,
+                "title": plan_module.title_from_template(
+                    template, display, payload["title"]) if "{action}" in template
+                    else payload["title"],
+                "action": payload["action"],
+                "completion_standard": payload["completion_standard"],
+                "due_date": payload.get("due_date"),
+                "internal_review": payload.get("internal_review"),
+                "evidence": payload.get("evidence") or (
+                    f"客户来信：{message.get('date')}｜{message.get('from')}｜"
+                    f"{message.get('subject')}"),
+                "evidence_date": message.get("date"),
+                "message_id": payload.get("message_id"),
+                "source_locator": message.get("locator"),
+                "status": todo_label,
+                "origin": "judgment",
+                "generatedBy": payload.get("generatedBy"),
+            }
+            outcome = tasks_module.apply_candidate(client, config, mapping, kinds, candidate,
+                                                   existing, known_keys, commit=commit)
+            results["created"].append(outcome)
+            results["outcomes"].append({
+                "message_id": payload.get("message_id"), "decision": "create",
+                "action": outcome.get("action"), "page_id": outcome.get("page_id")})
+            if outcome["action"] in ("created", "updated") and outcome.get("page_id"):
+                state_module.upsert_task(state, candidate["identity"], {
+                    "identity": candidate["identity"], "title": candidate["title"],
+                    "customer_key": candidate["customer_key"],
+                    "page_id": outcome["page_id"],
+                    "message_id": candidate.get("message_id"),
+                    "source_locator": candidate.get("source_locator"),
+                    "status": "todo",
+                })
+                known_keys.add(candidate["identity"])
+                existing.append({"id": outcome["page_id"],
+                                 "properties": {"_created": True}})
+        elif kind == "complete":
+            outcome = complete_task(client, config, mapping, kinds, payload, state,
+                                    commit=commit)
+            results["completed"].append(outcome)
+            results["outcomes"].append({
+                "message_id": payload.get("message_id"), "decision": "complete",
+                "action": outcome.get("action"), "page_id": outcome.get("page_id")})
+        elif kind == "append":
+            identity = payload.get("identity")
+            record = state.get("tasks", {}).get(identity)
+            outcome = {"identity": identity, "action": None}
+            if not record or not record.get("page_id"):
+                outcome["action"] = "rejected"
+                outcome["reasons"] = ["task not in ledger"]
+            elif not commit:
+                outcome["action"] = "would_append"
+            else:
+                client.append_children(record["page_id"], [
+                    paragraph(f"补充证据（{payload.get('note') or '未注明'}）："
+                              f"{payload.get('evidence')}")])
+                outcome["action"] = "appended"
+            results["appended"].append(outcome)
+            results["outcomes"].append({
+                "message_id": payload.get("message_id"), "decision": "append",
+                "action": outcome["action"], "page_id": record.get("page_id") if record else None})
+        elif kind == "hold":
+            results["held"].append({"message_id": payload.get("message_id"),
+                                    "reason": payload.get("reason")})
+            results["outcomes"].append({
+                "message_id": payload.get("message_id"), "decision": "hold",
+                "action": "held"})
+    return results
+
+
 def apply_candidates(config, client, summary, state, commit):
-    """Validate and write task candidates + completions. Dry-run by default."""
+    """Validate and write task candidates + completions. Dry-run by default.
+
+    This is the *mechanical* path (kept for users without an agent and for
+    tests). The agent path is ``build_judgment_request`` + ``apply_judgment``.
+    """
     data_source_id = plan_module.task_data_source_id(config)
     schema, status_options = tasks_module.discover_properties(client, data_source_id)
     mapping, kinds, problems = tasks_module.resolve_mapping(config, schema)
@@ -734,10 +909,18 @@ def complete_task(client, config, mapping, kinds, candidate, state, commit):
     identity = candidate.get("identity")
     record = state.get("tasks", {}).get(identity)
     gate = tasks_module.completion_gate(candidate, record)
+    trace = tasks_module.verify_evidence_locator(candidate, state)
     outcome = {"identity": identity, "title": candidate.get("title"),
-               "action": None, "reasons": gate["reasons"], "page_id": None}
+               "action": None, "reasons": gate["reasons"], "page_id": None,
+               "traceability": trace}
     if not gate["allowed"]:
         outcome["action"] = "rejected"
+        return outcome
+    if not trace["verifiable"]:
+        outcome["action"] = "rejected"
+        outcome["reasons"] = ["evidence is not traceable to an archived original",
+                              *(f"{c['check']} failed" for c in trace["checks"]
+                                if not c["ok"])]
         return outcome
     outcome["page_id"] = record["page_id"]
     if not commit:

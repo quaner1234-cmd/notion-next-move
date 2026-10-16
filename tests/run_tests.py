@@ -466,6 +466,55 @@ class LoopEndToEnd(unittest.TestCase):
         good = {"evidence": "replied", "source_locator": "https://www.notion.so/x",
                 "message_id": "<m@x>"}
         self.assertTrue(tasks_module.completion_gate(good, record)["allowed"])
+        # the gate is explicit about its own scope: well-formed, not verified
+        self.assertEqual(gate["scope"], "well_formed_claim_not_verified_outcome")
+
+    def test_completion_traceability_distinguishes_claim_from_source(self):
+        """Field completeness != the evidence actually tracing to an archive."""
+        state = {"archived": [{"message_id": "<m1@x>",
+                               "locator": "https://www.notion.so/page-a#blk1"}]}
+        # an invented message id is a well-formed but untraceable claim
+        r = tasks_module.verify_evidence_locator(
+            {"message_id": "<invented@x>", "source_locator": "https://www.notion.so/page-a"},
+            state)
+        self.assertFalse(r["verifiable"])
+        self.assertFalse([c for c in r["checks"]
+                          if c["check"] == "message_id_in_archive_ledger"][0]["ok"])
+        # a locator pointing at a different page fails too
+        r = tasks_module.verify_evidence_locator(
+            {"message_id": "<m1@x>", "source_locator": "https://www.notion.so/other-page"},
+            state)
+        self.assertFalse(r["verifiable"])
+        # the archived original traces
+        r = tasks_module.verify_evidence_locator(
+            {"message_id": "<m1@x>", "source_locator": "https://www.notion.so/page-a#blk2"},
+            state)
+        self.assertTrue(r["verifiable"])
+        self.assertEqual(r["scope"], "traceable_to_archived_source_not_business_truth")
+
+    def test_invented_evidence_cannot_complete_a_task(self):
+        """End to end: a completion whose message was never archived is refused."""
+        page_id = self.seed_customer_page("alpha")
+        self.h.config["customers"][0]["page_id"] = page_id
+        alpha = mailbuilder.CUSTOMERS["alpha"]
+        self.folders["INBOX"] = [build_inbound(1, alpha, "Need pricing",
+                                               "<trace-1@alpha-trading.example>")]
+        packet, state = self.h.scan(commit=True)
+        _, results = self.h.apply(packet, state, commit=True)
+        task_id = results["tasks"][0]["page_id"]
+        identity = results["tasks"][0]["identity"]
+        self.assertEqual(self.h.notion.page_status(task_id), "Todo")
+        # an agent claims completion with a message id that was never archived
+        outcome = loop.complete_task(
+            self.h.notion, self.h.config, {"status": "状态"}, {"status": "status"},
+            {"identity": identity, "evidence": "声称已回复",
+             "source_locator": "https://www.notion.so/whatever",
+             "message_id": "<invented-reply@nowhere.example>"},
+            state, commit=True)
+        self.assertEqual(outcome["action"], "rejected")
+        self.assertFalse(outcome["traceability"]["verifiable"])
+        self.assertEqual(self.h.notion.page_status(task_id), "Todo",
+                         "an untraceable claim completed the task")
 
     def test_outbound_only_thread_does_not_create_or_complete_anything(self):
         page_id = self.seed_customer_page("alpha")
@@ -624,6 +673,288 @@ class TasksUnit(unittest.TestCase):
         self.assertIsNotNone(found)
 
 
+class JudgmentUnit(unittest.TestCase):
+    """The judgement channel: request building + validation boundaries."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="nextmove-judgment-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.config = config_module.load(make_config(self.tmp))
+        self.config["customers"][0]["page_id"] = "page-alpha"
+        self.state = {
+            "tasks": {
+                "open-task-1": {"identity": "open-task-1", "title": "Alpha reply",
+                                "customer_key": "alpha", "page_id": "task-page-1",
+                                "message_id": "<alpha-1@alpha-trading.example>",
+                                "status": "todo"},
+            },
+            "archived": [
+                {"message_id": "<alpha-1@alpha-trading.example>", "customer_key": "alpha",
+                 "page_id": "page-alpha", "locator": "https://www.notion.so/page-alpha#blk1"},
+                {"message_id": "<reply-1@company.example>", "customer_key": "alpha",
+                 "page_id": "page-alpha", "locator": "https://www.notion.so/page-alpha#blk2"},
+            ],
+        }
+
+    def _message(self, mid="<alpha-2@alpha-trading.example>", direction="inbound"):
+        return {
+            "message_id": mid, "customer_key": "alpha",
+            "customer_display": "Alpha Trading", "direction": direction,
+            "date": "Fri, 16 Oct 2026 09:30:00 +0800", "from": "buyer@alpha-trading.example",
+            "subject": "Quote please", "body_preview": "Please quote 300 units.",
+            "body_truncated_in_packet": False, "attachments": [], "locator":
+                "https://www.notion.so/page-alpha#blk3",
+            "thread_references": [],
+        }
+
+    def _request(self, messages=None):
+        from nextmove import judgment
+        packet = {"new_messages": messages if messages is not None else [self._message()]}
+        request = loop.build_judgment_request(self.config, packet, self.state)
+        request["requestId"] = judgment.request_id(request)
+        return request
+
+    def _validate(self, document, request):
+        from nextmove import judgment
+        return judgment.validate(document, request, self.config, self.state)
+
+    def test_request_carries_messages_tasks_rules_and_stable_id(self):
+        request = self._request()
+        self.assertEqual(request["kind"], "judgment_request")
+        self.assertEqual(len(request["messages"]), 1)
+        self.assertEqual(request["messages"][0]["locator"],
+                         "https://www.notion.so/page-alpha#blk3")
+        self.assertEqual(request["open_tasks"][0]["identity"], "open-task-1")
+        self.assertIn("decision_types", request["instructions"])
+        again = self._request()
+        self.assertEqual(request["requestId"], again["requestId"])
+        # a new message changes the id
+        more = self._request([self._message(), self._message("<alpha-3@alpha-trading.example>")])
+        self.assertNotEqual(request["requestId"], more["requestId"])
+
+    def test_valid_create_passes_and_carries_request_facts(self):
+        request = self._request()
+        document = {"kind": "judgment", "basedOn": request["requestId"], "decisions": [{
+            "decision": "create", "customer_key": "alpha",
+            "message_id": "<alpha-2@alpha-trading.example>",
+            "title": "Alpha Trading｜报价 300 件并核对交期",
+            "action": "核价后回复客户报价区间与交期",
+            "completion_standard": "报价邮件已发出且客户已收到",
+            "generatedBy": "test-agent",
+        }]}
+        result = self._validate(document, request)
+        self.assertTrue(result["ok"], result)
+        decision = result["decisions"][0]
+        self.assertEqual(decision["status"], "valid")
+        # evidence locator comes from the request, not the judgment
+        self.assertEqual(decision["payload"]["message"]["locator"],
+                         "https://www.notion.so/page-alpha#blk3")
+        self.assertIsNone(decision["payload"]["due_date"])
+
+    def test_create_rejections(self):
+        request = self._request()
+        base = {"decision": "create", "customer_key": "alpha",
+                "message_id": "<alpha-2@alpha-trading.example>",
+                "title": "T", "action": "A", "completion_standard": "C"}
+        cases = {
+            "unknown message": {**base, "message_id": "<never-seen@x.example>"},
+            "wrong customer": {**base, "customer_key": "bravo"},
+            "empty title": {**base, "title": "  "},
+            "placeholder title": {**base, "title": "TODO"},
+            "missing action": {**base, "action": ""},
+            "bad date": {**base, "due_date": "next week"},
+            "unapproved field": {**base, "amount": 12345},
+        }
+        for label, decision in cases.items():
+            result = self._validate({"kind": "judgment", "basedOn": request["requestId"],
+                                     "decisions": [decision]}, request)
+            self.assertFalse(result["ok"], f"{label} should not validate")
+            self.assertTrue(result["decisions"][0]["problems"], label)
+
+    def test_complete_requires_archived_evidence(self):
+        request = self._request()
+        good = {"decision": "complete", "identity": "open-task-1",
+                "evidence": "已发出报价", "source_locator": "https://www.notion.so/page-alpha#blk2",
+                "message_id": "<reply-1@company.example>", "evidence_date": "2026-10-16"}
+        result = self._validate({"kind": "judgment", "basedOn": request["requestId"],
+                                 "decisions": [good]}, request)
+        self.assertTrue(result["ok"], result)
+        # an evidence id that was never archived cannot complete anything
+        bad = {**good, "message_id": "<invented@nowhere.example>"}
+        result = self._validate({"kind": "judgment", "basedOn": request["requestId"],
+                                 "decisions": [bad]}, request)
+        self.assertFalse(result["ok"])
+        self.assertIn("not an archived original", result["decisions"][0]["problems"][0])
+        # a task that is not in local state cannot be completed
+        bad = {**good, "identity": "not-a-task"}
+        result = self._validate({"kind": "judgment", "basedOn": request["requestId"],
+                                 "decisions": [bad]}, request)
+        self.assertFalse(result["ok"])
+
+    def test_hold_and_append(self):
+        request = self._request()
+        hold = {"decision": "hold", "message_id": "<alpha-2@alpha-trading.example>",
+                "reason": "courtesy mail, no action needed"}
+        result = self._validate({"kind": "judgment", "basedOn": request["requestId"],
+                                 "decisions": [hold]}, request)
+        self.assertTrue(result["ok"], result)
+        append = {"decision": "append", "identity": "open-task-1",
+                  "message_id": "<alpha-2@alpha-trading.example>",
+                  "evidence": "客户补充了数量 300"}
+        result = self._validate({"kind": "judgment", "basedOn": request["requestId"],
+                                 "decisions": [append]}, request)
+        self.assertTrue(result["ok"], result)
+
+    def test_missing_based_on_is_rejected_whole(self):
+        request = self._request()
+        document = {"kind": "judgment", "decisions": [
+            {"decision": "hold", "message_id": "<alpha-2@alpha-trading.example>",
+             "reason": "x"}]}
+        result = self._validate(document, request)
+        self.assertFalse(result["ok"])
+        self.assertIn("basedOn", result["error"])
+
+
+class JudgmentLoop(unittest.TestCase):
+    """End-to-end: queue -> request -> judgment -> Notion, with retries."""
+
+    def setUp(self):
+        self.h = LoopHarness(mailbuilder.standard_folders())
+        self.addCleanup(self.h.close)
+        page = self.h.notion.create_page(
+            self.h.notion.data_source_id,
+            {"任务名称": {"title": [{"type": "text", "text": {"content": "Customer page"}}]}},
+            children=[])
+        self.h.config["customers"][0]["page_id"] = page["id"]
+        self.page_id = page["id"]
+
+    def _queue_and_request(self):
+        """Scan (full baseline) -> queue -> request, as the CLI does."""
+        alpha = mailbuilder.CUSTOMERS["alpha"]
+        self.h.server.folders["INBOX"].append(build_inbound(
+            1, alpha, "New order request", "<j-1@alpha-trading.example>"))
+        packet, state = self.h.scan(commit=True)
+        from nextmove import state as state_module
+        queued = state_module.queue_judgment_messages(state, packet.get("new_messages", []))
+        state_module.write(self.h.state_path, state)
+        request = loop.build_judgment_request(
+            self.h.config, {"new_messages": state["judgmentQueue"]}, state)
+        from nextmove import judgment
+        request["requestId"] = judgment.request_id(request)
+        return request, state, queued
+
+    def test_judgment_create_updates_notion_and_dequeues(self):
+        from nextmove import judgment
+        request, state, queued = self._queue_and_request()
+        self.assertEqual(len(queued), 1)
+        document = {"kind": "judgment", "basedOn": request["requestId"], "decisions": [{
+            "decision": "create", "customer_key": "alpha",
+            "message_id": "<j-1@alpha-trading.example>",
+            "title": "Alpha Trading｜核价 300 件并回复报价",
+            "action": "与工厂核价后回复客户报价区间与交期",
+            "completion_standard": "报价邮件已发出且客户已收到",
+            "generatedBy": "test-agent",
+        }]}
+        validation = judgment.validate(document, request, self.h.config, state)
+        self.assertTrue(validation["ok"], validation)
+        results = loop.apply_judgment(self.h.config, self.h.notion, validation, state,
+                                      commit=True)
+        self.assertEqual(results["created"][0]["action"], "created")
+        task_id = results["created"][0]["page_id"]
+        title = self.h.notion.page_titles()[task_id]
+        self.assertIn("核价 300 件", title)
+        self.assertEqual(self.h.notion.page_status(task_id), "Todo")
+        self.assertIn("来源", self.h.notion.page_text(task_id))
+        # dequeue only the landed message
+        landed = {"created", "updated", "duplicate", "completed", "appended", "held"}
+        handled = [o["message_id"] for o in results["outcomes"]
+                   if o["action"] in landed]
+        from nextmove import state as state_module
+        state_module.mark_judged(state, handled, request["requestId"])
+        self.assertEqual(state["judgmentQueue"], [])
+
+    def test_rejected_decision_leaves_message_queued(self):
+        from nextmove import judgment
+        from nextmove import state as state_module
+        request, state, _ = self._queue_and_request()
+        document = {"kind": "judgment", "basedOn": request["requestId"], "decisions": [{
+            "decision": "create", "customer_key": "alpha",
+            "message_id": "<j-1@alpha-trading.example>",
+            "title": "TODO", "action": "A", "completion_standard": "C",
+        }]}
+        validation = judgment.validate(document, request, self.h.config, state)
+        self.assertFalse(validation["ok"])
+        # nothing lands, so nothing is dequeued
+        landed = {"created", "updated", "duplicate", "completed", "appended", "held"}
+        handled = []
+        state_module.mark_judged(state, handled, request["requestId"])
+        self.assertEqual(len(state["judgmentQueue"]), 1)
+        self.assertIn("placeholder", "; ".join(validation["decisions"][0]["problems"]))
+
+    def test_judgment_is_idempotent_after_reapply(self):
+        """Applying the same basedOn twice is refused the second time."""
+        from nextmove import judgment
+        from nextmove import state as state_module
+        request, state, _ = self._queue_and_request()
+        document = {"kind": "judgment", "basedOn": request["requestId"], "decisions": [{
+            "decision": "create", "customer_key": "alpha",
+            "message_id": "<j-1@alpha-trading.example>",
+            "title": "Alpha Trading｜核价并回复",
+            "action": "核价后回复", "completion_standard": "报价已发出",
+        }]}
+        validation = judgment.validate(document, request, self.h.config, state)
+        results = loop.apply_judgment(self.h.config, self.h.notion, validation, state,
+                                      commit=True)
+        landed = {"created", "updated", "duplicate", "completed", "appended", "held"}
+        state_module.mark_judged(
+            state, [o["message_id"] for o in results["outcomes"] if o["action"] in landed],
+            request["requestId"])
+        self.assertTrue(state_module.judgment_already_applied(state, request["requestId"]))
+        # the same judgment document applied again is refused before writing
+        pages_before = len(self.h.notion.pages)
+        # (mirrors the CLI guard: already-applied check happens first)
+        if not state_module.judgment_already_applied(state, document["basedOn"]):
+            loop.apply_judgment(self.h.config, self.h.notion, validation, state, commit=True)
+        self.assertEqual(len(self.h.notion.pages), pages_before)
+
+    def test_partial_judgment_applies_only_queued_messages(self):
+        """A judgment covering a message already handled can still apply the rest."""
+        from nextmove import judgment
+        from nextmove import state as state_module
+        request, state, _ = self._queue_and_request()
+        # simulate: message A was judged in a previous round and left the queue;
+        # a new message B arrives and is queued.
+        alpha = mailbuilder.CUSTOMERS["alpha"]
+        self.h.server.folders["INBOX"].append(build_inbound(
+            2, alpha, "Second question", "<j-2@alpha-trading.example>"))
+        packet, state = self.h.scan(commit=True)
+        state_module.queue_judgment_messages(state, packet.get("new_messages", []))
+        # drop the first from the queue to mimic "already handled"
+        state["judgmentQueue"] = [q for q in state["judgmentQueue"]
+                                  if q["message_id"] == "<j-2@alpha-trading.example>"]
+        request2 = loop.build_judgment_request(
+            self.h.config, {"new_messages": state["judgmentQueue"]}, state)
+        request2["requestId"] = judgment.request_id(request2)
+        # an older document (based on the old set) with decisions for both A and B
+        old_document = {"kind": "judgment", "basedOn": request["requestId"], "decisions": [
+            {"decision": "create", "customer_key": "alpha",
+             "message_id": "<j-1@alpha-trading.example>",
+             "title": "A-task", "action": "A", "completion_standard": "C"},
+            {"decision": "create", "customer_key": "alpha",
+             "message_id": "<j-2@alpha-trading.example>",
+             "title": "B-task", "action": "A", "completion_standard": "C"},
+        ]}
+        validation = judgment.validate(old_document, request2, self.h.config, state)
+        statuses = {d.get("decision"): d["status"] for d in validation["decisions"]}
+        # A is no longer in the request -> rejected; B still applies
+        self.assertEqual(validation["decisions"][0]["status"], "rejected")
+        self.assertEqual(validation["decisions"][1]["status"], "valid")
+        results = loop.apply_judgment(self.h.config, self.h.notion, validation, state,
+                                      commit=True)
+        self.assertEqual(len(results["created"]), 1)
+        self.assertEqual(len(results["rejected"]), 1)
+
+
 class CliSmoke(unittest.TestCase):
     """The CLI runs end to end against fakes: doctor/check/status shapes."""
 
@@ -664,6 +995,65 @@ class CliSmoke(unittest.TestCase):
         writes = self.h.notion.write_calls()
         self.assertEqual(writes, [], "check attempted a Notion write")
 
+    def test_cli_judgment_chain_scan_request_apply(self):
+        """The full daily chain via the CLI: scan -> request -> apply --judgment."""
+        from nextmove import cli
+        page = self.h.notion.create_page(
+            self.h.notion.data_source_id,
+            {"任务名称": {"title": [{"type": "text", "text": {"content": "Alpha"}}]}},
+            children=[])
+        # persist the customer page id so the CLI (which re-reads the config)
+        # resolves the customer page
+        data = json.loads(self.h.config_path.read_text(encoding="utf-8"))
+        data["customers"][0]["page_id"] = page["id"]
+        self.h.config_path.write_text(json.dumps(data, ensure_ascii=False),
+                                      encoding="utf-8")
+        alpha = mailbuilder.CUSTOMERS["alpha"]
+        self.h.server.folders["INBOX"].append(build_inbound(
+            1, alpha, "Please quote", "<cli-1@alpha-trading.example>"))
+        cfg = ["--config", str(self.h.config_path)]
+        # 1. scan (full baseline) queues the message and writes the request
+        code, report = _run_cli(cli, self.h, cfg + ["scan", "--baseline", "full"])
+        self.assertEqual(report["status"], "SCANNED")
+        self.assertEqual(report["queued_for_judgment"], 1)
+        request_path = Path(report["judgment_request"])
+        self.assertTrue(request_path.exists())
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        # 2. the agent writes the judgment next to the request
+        judgment_path = request_path.parent / "judgment.json"
+        judgment_path.write_text(json.dumps({
+            "kind": "judgment", "basedOn": request["requestId"],
+            "decisions": [{"decision": "create", "customer_key": "alpha",
+                           "message_id": "<cli-1@alpha-trading.example>",
+                           "title": "Alpha Trading｜核价并回复",
+                           "action": "核价后回复", "completion_standard": "报价已发出"}],
+        }, ensure_ascii=False), encoding="utf-8")
+        # 3. dry run: nothing written
+        pages_before = len(self.h.notion.pages)
+        code, report = _run_cli(cli, self.h, cfg + ["apply", "--judgment", str(judgment_path)])
+        self.assertEqual(report["status"], "JUDGMENT_DRY_RUN")
+        self.assertEqual(len(self.h.notion.pages), pages_before)
+        # 4. commit: the task lands
+        code, report = _run_cli(cli, self.h, cfg + ["apply", "--judgment",
+                                                    str(judgment_path), "--commit"])
+        self.assertEqual(report["status"], "JUDGMENT_APPLIED")
+        self.assertEqual(len(report["results"]["created"]), 1)
+        self.assertEqual(len(self.h.notion.pages), pages_before + 1)
+        # 5. applying the same judgment again is refused (idempotent)
+        code, report = _run_cli(cli, self.h, cfg + ["apply", "--judgment",
+                                                    str(judgment_path), "--commit"])
+        self.assertEqual(report["status"], "ALREADY_APPLIED")
+        self.assertEqual(len(self.h.notion.pages), pages_before + 1)
+
+    def test_cli_judgment_request_command(self):
+        from nextmove import cli
+        code, report = _run_cli(cli, self.h, ["--config", str(self.h.config_path),
+                                              "judgment-request"])
+        self.assertEqual(report["status"], "REQUEST_WRITTEN")
+        self.assertTrue(Path(report["request"]).exists())
+        # empty queue -> zero messages, still a valid request file
+        self.assertEqual(report["messages"], 0)
+
 
 def _run_cli(cli, harness, argv, expect_exit=0):
     """Run a CLI command with the harness's fake mailbox and Notion patched in."""
@@ -696,7 +1086,8 @@ def _run_cli(cli, harness, argv, expect_exit=0):
 def main():
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
-    for case in (PlanUnit, ReadOnlyContract, LoopEndToEnd, ConfigUnit, TasksUnit, CliSmoke):
+    for case in (PlanUnit, ReadOnlyContract, LoopEndToEnd, ConfigUnit, TasksUnit,
+                 JudgmentUnit, JudgmentLoop, CliSmoke):
         suite.addTests(loader.loadTestsFromTestCase(case))
     runner = unittest.TextTestRunner(verbosity=2, stream=sys.stdout)
     result = runner.run(suite)

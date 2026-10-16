@@ -261,9 +261,19 @@ def apply_candidate(client, config, mapping, kinds, candidate, existing_pages,
 def completion_gate(candidate_evidence, task_record):
     """Mechanical precondition for marking a task done.
 
-    Requires a real evidence locator and either an evidence date or a message
-    id — a task cannot be completed by editing its title. ``task_record`` is
-    the local ledger entry (must exist and reference a live page).
+    **What this gate does and does not do — read carefully.**
+
+    It checks *completeness and traceability of the claim*: the task exists in
+    the local ledger with a live page, the completion note carries evidence
+    text, a source locator, and a date or message id. It does NOT verify that
+    the evidence is real, that the locator points at the claimed outcome, or
+    that the outcome actually happened — that is human (or agent) judgement
+    and is deliberately outside the tool.
+
+    So: a task that passes this gate is *well-formed*, not *verified true*.
+    The `verify_evidence_locator` helper below is what raises the bar from
+    "well-formed" to "the locator resolves to a message that was actually
+    archived by this tool"; callers that can check it should.
     """
     reasons = []
     if not task_record or not task_record.get("page_id"):
@@ -274,4 +284,34 @@ def completion_gate(candidate_evidence, task_record):
         reasons.append("evidence source locator (URL) is required")
     if not (candidate_evidence.get("evidence_date") or candidate_evidence.get("message_id")):
         reasons.append("evidence date or message id is required")
-    return {"allowed": not reasons, "reasons": reasons}
+    return {"allowed": not reasons, "reasons": reasons,
+            "scope": "well_formed_claim_not_verified_outcome"}
+
+
+def verify_evidence_locator(candidate_evidence, state):
+    """Raise the completion check from 'well-formed' to 'traceable to source'.
+
+    Returns ``{"verifiable": bool, "checks": [...]}``. When a message id is
+    given it must appear in the local archive ledger (this tool archived it);
+    when only a locator is given it must be a Notion URL under the same
+    workspace shape the archive uses. A pass still proves traceability, not
+    business truth — the outcome itself remains the user's judgement.
+    """
+    checks = []
+    ident = None
+    message_id = candidate_evidence.get("message_id")
+    if message_id:
+        from .plan import normalize_message_id
+        wanted = normalize_message_id(message_id)
+        ident = next((item for item in state.get("archived", [])
+                      if normalize_message_id(item.get("message_id")) == wanted), None)
+        checks.append({"check": "message_id_in_archive_ledger", "ok": bool(ident)})
+    locator = str(candidate_evidence.get("source_locator") or "").strip()
+    locator_ok = locator.startswith(("https://www.notion.so/", "https://app.notion.com/p/"))
+    checks.append({"check": "locator_is_notion_url", "ok": locator_ok})
+    if ident and locator and ident.get("locator"):
+        same_page = ident["locator"].split("#")[0].rstrip("/") == locator.split("#")[0].rstrip("/")
+        checks.append({"check": "locator_matches_archived_page", "ok": same_page})
+    verifiable = all(c["ok"] for c in checks) and bool(checks)
+    return {"verifiable": verifiable, "checks": checks,
+            "scope": "traceable_to_archived_source_not_business_truth"}
