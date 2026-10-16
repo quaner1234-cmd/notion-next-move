@@ -89,7 +89,7 @@ judgement, which is the point.
 ## Guarantees you can verify
 
 Enforced in code and covered by the offline suite (`python tests/run_tests.py`,
-51 checks, no network needed) plus `python tests/acceptance_daily_chain.py`
+52 checks, no network needed) plus `python tests/acceptance_daily_chain.py`
 (27 checks driving the real CLI through seven runs):
 
 - **Read-only mail.** Every session is `EXAMINE`; only `BODY.PEEK`. No
@@ -164,7 +164,7 @@ here. **Never** type it into a chat.
 
 See **[docs/MAC-SETUP.md](docs/MAC-SETUP.md)** — written for someone who has
 never opened Terminal. It includes the exact commands for the whole daily
-chain and a verified cron line.
+chain and a copy-paste cron line.
 
 ## First run
 
@@ -179,9 +179,12 @@ only senders that resolve to a configured customer are archived).
 Nothing is scheduled for you. One line is enough (adjust the time):
 
 ```bash
+# run this first and copy the path it prints (cron does not read your shell
+# profile, so the line must carry the exact interpreter path):
+command -v python3
 crontab -e
-# every weekday at 08:30, full daily chain:
-30 8 * * 1-5 cd "$HOME/Documents/notion-next-move" && mkdir -p logs && /usr/bin/python3 -m nextmove scan --apply-judgment >> logs/scan.log 2>&1
+# every weekday at 08:30, full daily chain (replace the path with yours):
+30 8 * * 1-5 cd "$HOME/Documents/notion-next-move" && mkdir -p logs && /usr/local/bin/python3 -m nextmove scan --apply-judgment >> logs/scan.log 2>&1
 ```
 
 If you already run a sync task (any tool), keep it and just add the
@@ -216,7 +219,7 @@ If you already run a sync task (any tool), keep it and just add the
 ## Tests
 
 ```bash
-python tests/run_tests.py                 # 51 offline unit/loop checks
+python tests/run_tests.py                 # 52 offline unit/loop checks
 python tests/acceptance_daily_chain.py    # 27 checks: 7 scheduled runs via the CLI
 ```
 
