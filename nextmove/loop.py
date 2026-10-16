@@ -774,7 +774,6 @@ def apply_judgment(config, client, validation, state, commit):
     known_keys = {record.get("identity") for record in state.get("tasks", {}).values()
                   if record.get("identity")}
     customers = config_module.customers_by_key(config)
-    template = config["policy"].get("title_template") or "{customer}｜{action}"
     todo_label = tasks_module.status_value(config, "todo")
     results = {"created": [], "completed": [], "appended": [], "held": [],
                "rejected": [], "outcomes": [], "commit": bool(commit),
@@ -796,9 +795,10 @@ def apply_judgment(config, client, validation, state, commit):
                                                       payload.get("message_id")),
                 "customer_key": payload["customer_key"],
                 "customer_display": display,
-                "title": plan_module.title_from_template(
-                    template, display, payload["title"]) if "{action}" in template
-                    else payload["title"],
+                # The agent writes the title in its own words (it is told to);
+                # unlike the mechanical path, no template is applied on top —
+                # that would double the customer prefix the agent already used.
+                "title": payload["title"],
                 "action": payload["action"],
                 "completion_standard": payload["completion_standard"],
                 "due_date": payload.get("due_date"),

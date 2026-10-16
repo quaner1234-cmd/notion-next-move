@@ -917,6 +917,25 @@ class JudgmentLoop(unittest.TestCase):
             loop.apply_judgment(self.h.config, self.h.notion, validation, state, commit=True)
         self.assertEqual(len(self.h.notion.pages), pages_before)
 
+    def test_create_decision_title_is_used_as_written(self):
+        """The agent's title is not re-templated (no doubled customer prefix)."""
+        from nextmove import judgment
+        request, state, _ = self._queue_and_request()
+        document = {"kind": "judgment", "basedOn": request["requestId"], "decisions": [{
+            "decision": "create", "customer_key": "alpha",
+            "message_id": "<j-1@alpha-trading.example>",
+            "title": "Alpha Trading｜核价并回复报价",
+            "action": "核价后回复", "completion_standard": "报价已发出",
+        }]}
+        validation = judgment.validate(document, request, self.h.config, state)
+        self.assertTrue(validation["ok"], validation)
+        results = loop.apply_judgment(self.h.config, self.h.notion, validation, state,
+                                      commit=True)
+        task_id = results["created"][0]["page_id"]
+        title = self.h.notion.page_titles()[task_id]
+        self.assertEqual(title, "Alpha Trading｜核价并回复报价",
+                         "the title was templated on top of the agent's own wording")
+
     def test_partial_judgment_applies_only_queued_messages(self):
         """A judgment covering a message already handled can still apply the rest."""
         from nextmove import judgment
