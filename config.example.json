@@ -1,0 +1,68 @@
+{
+  "_comment": "Copy this file to nextmove.config.json and fill in your own values. Secrets do NOT go here — use the environment (NEXTMOVE_IMAP_PASSWORD / NOTION_TOKEN) or a local secrets.json (git-ignored).",
+
+  "mailbox": {
+    "account": "work",
+    "host": "imap.your-provider.com",
+    "port": 993,
+    "user": "you@your-company.com",
+    "password_env": "NEXTMOVE_IMAP_PASSWORD",
+    "inbox_folder": "INBOX",
+    "sent_folder": "Sent",
+    "timeout_seconds": 30
+  },
+
+  "notion": {
+    "token_env": "NOTION_TOKEN",
+    "notion_version": "2025-09-03",
+    "task_database_id": "REPLACE-WITH-YOUR-TASK-DATABASE-ID",
+    "task_data_source_id": null,
+    "owner_user_id": null,
+    "properties": {
+      "title": "任务名称",
+      "status": "状态",
+      "owner": "负责人",
+      "customer": "客户",
+      "key": "任务标识",
+      "due_date": "截止日期",
+      "internal_review": "内部复查日期",
+      "last_checked": "最后核验",
+      "source_locator": "来源链接"
+    },
+    "status_map": {
+      "todo": "未开始",
+      "in_progress": "进行中",
+      "done": "完成",
+      "archived": "已归档"
+    }
+  },
+
+  "customers": [
+    {
+      "key": "alpha-trading",
+      "display_name": "Alpha Trading",
+      "email_addresses": ["buyer@alpha-trading.example"],
+      "email_domains": ["alpha-trading.example"],
+      "notion_name": "Alpha Trading",
+      "page_id": "REPLACE-WITH-THE-CUSTOMERS-NOTION-PAGE-ID"
+    },
+    {
+      "key": "bravo-works",
+      "display_name": "Bravo Works",
+      "email_addresses": ["hello@bravo-works.example"],
+      "email_domains": ["bravo-works.example"],
+      "notion_name": "Bravo Works",
+      "page_id": "REPLACE-WITH-THE-CUSTOMERS-NOTION-PAGE-ID"
+    }
+  ],
+
+  "policy": {
+    "timezone": "+08:00",
+    "body_fetch_limit_per_run": 60,
+    "title_template": "{customer}｜{action}",
+    "state_dir": "state",
+    "runs_dir": "runs",
+    "secrets_file": "secrets.json",
+    "review_page_id": null
+  }
+}

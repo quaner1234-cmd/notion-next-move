@@ -1,0 +1,23 @@
+# Runtime output — scan packets and per-message files contain your real mail
+# metadata. Keep them out of Git.
+state/
+runs/
+
+# Local configuration and secrets — never commit these.
+nextmove.config.json
+secrets.json
+.env
+.env.*
+
+# Live-verification artifacts (workspace-specific ids; maintainer tooling)
+tests/_live_fixture.json
+tests/_live_demo/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Editors / OS
+.DS_Store
+*.swp
