@@ -27,13 +27,55 @@ acting.
 
 - Run `doctor`, `check`, `status` freely (read-only).
 - Run `scan` to archive new mail under the correct customer pages.
-- Read `runs/*/packet.json`, judge what each customer actually needs, and
-  produce `suggestions.json`.
-- Run `suggest` and `apply` (dry-run first) and report the diff.
+- Run `scan --apply-judgment` to archive new mail and apply a judgment
+  document (`state/judgment.json`) that is already waiting.
+- Read `state/judgment-request.json` (written by every `scan`), judge what
+  each customer actually needs, and write `state/judgment.json` following
+  the contract in §2.
+- Run `suggest` and `apply --input` (dry-run first) as the mechanical
+  fallback, and report the diff.
 - Complete a task **only** when `complete` accepts it: real evidence text,
-  a source locator, and a date or message id.
+  a source locator that resolves to an archived original, and a date or
+  message id.
 
-## 2. What needs a human decision first
+## 2. Judgment document contract
+
+Every `scan` writes `state/judgment-request.json`: the queued new messages
+(with previews and evidence locators), each customer's open tasks, and the
+decision rules. You judge; the tool only validates and persists. Your
+deliverable is `state/judgment.json`:
+
+```json
+{
+  "kind": "judgment",
+  "basedOn": "<requestId from the request>",
+  "generatedBy": "<your name>",
+  "decisions": [ ... ]
+}
+```
+
+Four decision types, one entry each. Every `message_id`, `identity`,
+`customer_key` and locator must come from the current request — the tool
+rejects anything it cannot trace to it, and rejects unapproved fields
+outright:
+
+- `create` — new task. `customer_key`, `message_id` (a queued message you
+  judged needs action), `title` (**full title, customer name included —
+  used exactly as written, never templated again**), `action`,
+  `completion_standard`, optional `due_date` (`YYYY-MM-DD`; never a promise
+  to the customer).
+- `complete` — finish an open task. `identity`, `evidence`,
+  `source_locator`, `message_id`, `evidence_date`.
+- `append` — add evidence to an open task. `identity`, `message_id`,
+  `evidence`.
+- `hold` — deliberately move nothing. `message_id`, `reason`.
+
+Only decisions that actually landed (created / updated / duplicate /
+completed / appended / held) leave the queue; rejected ones stay queued and
+are judged again. No trade rules are hard-coded: the judgement is entirely
+yours.
+
+## 3. What needs a human decision first
 
 - Enabling `apply --commit` for the first time (show the dry-run first).
 - Any change to `nextmove.config.json` that adds/removes customers or maps a
@@ -42,8 +84,10 @@ acting.
   conflicting thread ownership, attachment you cannot read.
 - Anything that would complete a task whose evidence you could not
   independently locate.
+- The first time you apply a judgment document for real, or after changing
+  how you interpret messages: run the dry-run and show the diff first.
 
-## 3. Judgement guidance (what makes a good "next move")
+## 4. Judgement guidance (what makes a good "next move")
 
 - One action per customer per advance. If nothing needs to move, do not
   invent a task; a courteous reply, a notification, or "waiting" is not an
@@ -56,7 +100,7 @@ acting.
 - Record the smallest completion test that would prove the task is done, and
   the evidence you based it on.
 
-## 4. Reporting
+## 5. Reporting
 
 When you finish a run, report in plain language:
 
@@ -64,12 +108,15 @@ When you finish a run, report in plain language:
 - what was archived (customer, subject, evidence locator);
 - what remains: review-queue items, deferred bodies, failed writes;
 - the task diff (created / duplicate-skipped / completed / rejected) with the
-  reason for anything rejected.
+  reason for anything rejected;
+- a completed task means the evidence claim is well-formed and traceable to
+  an archived original — **not** that the outcome was independently
+  verified. Report it as "completed (traceable)", not "verified done".
 
 Never report "done" for a step whose readback failed. A partial run is
 reported as partial.
 
-## 5. Data boundaries
+## 6. Data boundaries
 
 - Public repo, private life: the sample data in this repository is entirely
   fictional (reserved `.example` domains). Never add real customer names,
