@@ -64,6 +64,17 @@
     "state_dir": "state",
     "runs_dir": "runs",
     "secrets_file": "secrets.json",
-    "review_page_id": null
+    "review_page_id": null,
+
+    "_note_dedupe": "Tiered dedupe. 'mode': 'tiered' (default) uses the three ratios below; 'exact' keeps the old binary dedupe (identity key or identical title only). refresh_ratio: at or above it, the candidate is the same row. hold_ratio: at or above it but below refresh_ratio, the candidate is HELD for a human — nothing is created, nothing is overwritten. project_floor: when the customer has exactly one row and the score reaches this, treat it as the same row.",
+    "dedupe": {
+      "mode": "tiered",
+      "refresh_ratio": 0.72,
+      "hold_ratio": 0.42,
+      "project_floor": 0.30
+    },
+
+    "_note_protect_human_edits": "When true (default), a task row the human edited after this tool's last write is never flipped to done — it is reported as 'protected' instead. Set false only if you want the tool to win over manual edits.",
+    "protect_human_edits": true
   }
 }

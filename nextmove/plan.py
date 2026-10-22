@@ -300,3 +300,33 @@ def dedupe_text_summary(folder, scan, body_candidates):
         "gaps": scan.get("gaps"),
         "body_budget": len(body_candidates),
     }
+
+
+def packet_shape_problem(packet):
+    """Why ``packet`` cannot be read as a scan packet (``None`` when it can).
+
+    An unreadable input must never look like an empty input. Reading a
+    foreign JSON file here and reporting "0 suggestions" would silently
+    discard real work — the same failure as a producer renaming the section
+    an extractor greps for. So callers must check this first and report.
+    """
+    if not isinstance(packet, dict):
+        return "not a JSON object"
+    if "new_messages" not in packet:
+        return "missing the 'new_messages' key (expected a scan packet)"
+    if not isinstance(packet["new_messages"], list):
+        return "'new_messages' is not a list"
+    return None
+
+
+def suggestions_shape_problem(summary):
+    """Why ``summary`` cannot be read as a suggestions file (``None`` = fine)."""
+    if not isinstance(summary, dict):
+        return "not a JSON object"
+    if "tasks" not in summary and "completions" not in summary:
+        return ("missing both 'tasks' and 'completions' "
+                "(expected a suggestions.json written by `suggest`)")
+    for key in ("tasks", "completions"):
+        if key in summary and not isinstance(summary[key], list):
+            return f"'{key}' is not a list"
+    return None

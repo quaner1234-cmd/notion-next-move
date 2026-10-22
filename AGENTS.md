@@ -89,6 +89,20 @@ yours.
 
 ## 4. Judgement guidance (what makes a good "next move")
 
+- **A candidate the tool holds is yours to decide.** When a candidate only
+  *resembles* an existing task (similarity between `hold_ratio` and
+  `refresh_ratio`), the tool creates nothing and reports it as
+  `needs_review` with the score and the row it resembles. Say which it is:
+  the same work (then refresh the existing row) or new work (then create it).
+  Do not create a second row for something that already exists, and do not
+  drop a candidate just because it looks familiar.
+- **Never overwrite a human edit.** A row the human changed after the tool's
+  last write is reported `protected` and left untouched. Report it; do not
+  retry with a different status value to get around it.
+- **"Nothing to do" must be earned.** An unreadable or foreign input is
+  reported as `PACKET_UNRECOGNIZED` / `INPUT_UNRECOGNIZED`, not as zero new
+  items. If a run reports zero, it must also say what it actually read.
+
 - One action per customer per advance. If nothing needs to move, do not
   invent a task; a courteous reply, a notification, or "waiting" is not an
   action item.

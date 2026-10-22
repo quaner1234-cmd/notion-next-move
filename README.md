@@ -89,7 +89,7 @@ judgement, which is the point.
 ## Guarantees you can verify
 
 Enforced in code and covered by the offline suite (`python tests/run_tests.py`,
-52 checks, no network needed) plus `python tests/acceptance_daily_chain.py`
+66 checks, no network needed) plus `python tests/acceptance_daily_chain.py`
 (27 checks driving the real CLI through seven runs):
 
 - **Read-only mail.** Every session is `EXAMINE`; only `BODY.PEEK`. No
@@ -110,6 +110,57 @@ Enforced in code and covered by the offline suite (`python tests/run_tests.py`,
   that was never archived is **rejected** — the Python side owns that check.
 - **No destructive Notion operations.** The client has no delete/archive/move
   code path at all; the suite asserts it.
+- **Human edits win.** A row the human edited *after* this tool's last write
+  is never flipped to `Done` — it is reported as `protected` and left alone
+  (see [Human-edit protection](#human-edit-protection)).
+- **Unreadable input is never empty input.** `suggest` / `apply --input`
+  refuse a file whose shape they do not recognise instead of reporting
+  "0 suggestions" (see [Never "nothing to do"](#never-nothing-to-do)).
+
+### Tiered dedupe (0.72 / 0.42 / 0.30)
+
+A binary "duplicate or create" has two ways to be wrong, and both are bad:
+too strict creates a near-duplicate of an existing row; too loose swallows
+genuinely new work that merely resembles an old row. So a candidate gets one
+of four verdicts:
+
+| Verdict | When | What happens |
+|---|---|---|
+| `exact` | the stable identity key, or an identical normalized title | existing row is reused |
+| `same` | similarity ≥ `refresh_ratio` (0.72) — or the customer has a **single** row and similarity ≥ `project_floor` (0.30) | existing row is reused |
+| `near` | similarity ≥ `hold_ratio` (0.42) but below `refresh_ratio` | **held for a human**: nothing is created, nothing is overwritten, the run reports the resembling row and the score |
+| `new` | below `hold_ratio` | a task is created |
+
+Similarity is character-bigram **coverage of the longer title**, which is what
+makes it usable on CJK text (a paraphrase that `difflib` scores ~0.4 lands at
+0.5–0.9). It is measured against the longer side on purpose: the ported
+pipeline divided by the *shorter* side, which let a stub row titled `Alpha`
+score 1.0 against `Alpha Trading｜核价并回复` and swallow it — an existing
+test now pins that.
+
+Thresholds are yours to tune (`policy.dedupe`); `"mode": "exact"` restores the
+old binary behaviour for anyone who wants it.
+
+### Human-edit protection
+
+Every write this tool makes to a task row records *when* it wrote
+(`lastWriteAt` in the local ledger). Before a write that would change a
+human-visible field (flipping a task to `Done`), the page's Notion
+`last_edited_time` is compared with that stamp: if the human edited the row
+after the tool's last write, the write is refused, reported as `protected`,
+and the row is left as the human left it. Appending evidence is additive and
+still allowed. When the comparison cannot be made, the page counts as
+protected — absence of proof that we may write is not proof that we may.
+Disable with `policy.protect_human_edits: false` (not recommended).
+
+### Never "nothing to do"
+
+Reading a file whose shape the tool does not recognise must never look like
+an empty result: `suggest` on a foreign JSON reports `PACKET_UNRECOGNIZED`
+and exits non-zero, `apply --input` reports `INPUT_UNRECOGNIZED`. This is the
+generic form of a real failure seen in production — an extractor that grepped
+for a producer's exact heading renamed it, extracted 0 items, and marked the
+source consumed, so the real open item was lost for good.
 
 ### What "completion" does and does not mean — read this
 
@@ -219,13 +270,22 @@ If you already run a sync task (any tool), keep it and just add the
 ## Tests
 
 ```bash
-python tests/run_tests.py                 # 52 offline unit/loop checks
+python tests/run_tests.py                 # 66 offline unit/loop checks
 python tests/acceptance_daily_chain.py    # 27 checks: 7 scheduled runs via the CLI
+python tests/mutation_test.py             # proves the checks above can go red
 ```
 
 No network, no credentials, no real data: a fake IMAP server (speaking real
 IMAP to `imaplib`), a fake Notion API, and fully fictional customers in
 reserved `.example` domains.
+
+Every claim above is pinned by a test that fails when the behaviour is
+broken — the tiered-dedupe and protection paths were checked by re-running
+the suite with each defect reintroduced (revert the similarity formula,
+drop the `near` tier, ignore the configured thresholds, skip the hold path,
+blind the human-edit check, remove the completion gate, treat an
+unrecognised packet as empty): all seven turn the suite red and the source
+is restored byte-for-byte afterwards.
 
 ## License
 

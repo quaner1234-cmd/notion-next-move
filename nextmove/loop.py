@@ -29,6 +29,7 @@ from email import policy
 
 from . import config as config_module
 from . import mailcore, plan as plan_module
+from . import protection as protection_module
 from . import state as state_module
 from . import tasks as tasks_module
 from .notion import paragraph, rich_text
@@ -831,6 +832,8 @@ def apply_judgment(config, client, validation, state, commit):
                 known_keys.add(candidate["identity"])
                 existing.append({"id": outcome["page_id"],
                                  "properties": {"_created": True}})
+                _mark_written(config, client, state, candidate["identity"],
+                              outcome.get("page_id"))
         elif kind == "complete":
             outcome = complete_task(client, config, mapping, kinds, payload, state,
                                     commit=commit)
@@ -852,6 +855,7 @@ def apply_judgment(config, client, validation, state, commit):
                     paragraph(f"补充证据（{payload.get('note') or '未注明'}）："
                               f"{payload.get('evidence')}")])
                 outcome["action"] = "appended"
+                _mark_written(config, client, state, identity, record["page_id"])
             results["appended"].append(outcome)
             results["outcomes"].append({
                 "message_id": payload.get("message_id"), "decision": "append",
@@ -898,11 +902,32 @@ def apply_candidates(config, client, summary, state, commit):
             known_keys.add(candidate["identity"])
             existing.append({"id": outcome["page_id"],
                              "properties": {"_created": True}})
+            _mark_written(config, client, state, candidate["identity"],
+                          outcome.get("page_id"))
     for candidate in summary.get("completions", []):
         outcome = complete_task(client, config, mapping, kinds, candidate, state,
                                 commit=commit)
         results["completions"].append(outcome)
     return results
+
+
+def _mark_written(config, client, state, identity, page_id):
+    """Record that this tool wrote to ``page_id``, for human-edit protection.
+
+    The stamp is ``max(our clock, Notion's last_edited_time)`` so that a
+    server-side stamp a moment ahead of the local clock does not make the
+    next run mistake our own write for a human edit.
+    """
+    if not identity or not page_id:
+        return None
+    page_ts = None
+    try:
+        page_ts = (client.get_page(page_id) or {}).get("last_edited_time")
+    except Exception:
+        page_ts = None
+    offset = offset_from(config["policy"]["timezone"])
+    return state_module.record_task_write(
+        state, identity, protection_module.later_of(now_iso(offset), page_ts))
 
 
 def complete_task(client, config, mapping, kinds, candidate, state, commit):
@@ -923,6 +948,19 @@ def complete_task(client, config, mapping, kinds, candidate, state, commit):
                                 if not c["ok"])]
         return outcome
     outcome["page_id"] = record["page_id"]
+    # Human-edit protection: a row the human touched after our last write is
+    # never flipped to "done" by the tool — it is reported instead.
+    try:
+        live_page = client.get_page(record["page_id"])
+    except Exception:
+        live_page = None
+    guard = protection_module.decide(live_page, record, config.get("policy") or {})
+    outcome["protection"] = guard
+    if guard.get("protected"):
+        outcome["action"] = "protected"
+        outcome["reasons"] = ["a human edited this row after the tool's last "
+                              f"write ({guard.get('reason')}) — left untouched"]
+        return outcome
     if not commit:
         outcome["action"] = "would_complete"
         return outcome
@@ -938,6 +976,7 @@ def complete_task(client, config, mapping, kinds, candidate, state, commit):
     state_module.upsert_task(state, identity, {"status": "done",
                                                "completedAt": now_iso(offset_from(config['policy']['timezone'])),
                                                "completionEvidence": candidate.get("source_locator")})
+    _mark_written(config, client, state, identity, record["page_id"])
     outcome["action"] = "completed"
     return outcome
 

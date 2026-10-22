@@ -16,8 +16,14 @@ import copy
 import itertools
 import threading
 import uuid
+from datetime import datetime, timezone
 
 PAGE_SIZE = 100
+
+
+def _now_iso():
+    """Notion-shaped timestamp: ISO-8601 with a Z suffix, never naive."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 class FakeNotion:
@@ -176,6 +182,7 @@ class FakeNotion:
                 raise AssertionError(f"FakeNotion: unsupported kind {kind}")
         page = {"object": "page", "id": page_id, "url": "https://www.notion.so/" + page_id.replace("-", ""),
                 "properties": properties, "parent": payload.get("parent"),
+                "created_time": _now_iso(), "last_edited_time": _now_iso(),
                 "in_trash": False}
         self.pages[page_id] = page
         self.blocks[page_id] = list(payload.get("children") or [])
@@ -208,6 +215,17 @@ class FakeNotion:
                                             kind: _with_plain_text(value)}
             else:
                 page["properties"][name] = {"id": name, "type": kind, kind: value}
+        page["last_edited_time"] = _now_iso()
+        return page
+
+    def touch(self, page_id, when=None):
+        """Simulate a human editing a page (bumps ``last_edited_time``).
+
+        Tests use this to prove that a row a human changed after the tool's
+        last write is protected instead of being overwritten.
+        """
+        page = self._page(_canon(page_id))
+        page["last_edited_time"] = when or _now_iso()
         return page
 
     def _append_children(self, block_id, payload):
@@ -223,6 +241,8 @@ class FakeNotion:
             results.append(stored)
             if len(self.blocks[block_id]) > self.page_block_limit:
                 raise AssertionError("FakeNotion: page block limit exceeded")
+        if block_id in self.pages:
+            self.pages[block_id]["last_edited_time"] = _now_iso()
         return {"object": "list", "results": results}
 
     def _children(self, path):

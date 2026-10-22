@@ -23,7 +23,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from nextmove import config as config_module            # noqa: E402
+from nextmove import dedupe as dedupe_module            # noqa: E402
 from nextmove import loop, mailcore, plan as plan_module  # noqa: E402
+from nextmove import protection as protection_module      # noqa: E402
 from nextmove import state as state_module, tasks as tasks_module  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -434,6 +436,33 @@ class LoopEndToEnd(unittest.TestCase):
         self.assertIn("完成依据", self.h.notion.page_text(task_id))
         done = [t for t in state2["tasks"].values() if t.get("status") == "done"]
         self.assertEqual(len(done), 1)
+
+    def test_human_edit_after_our_write_protects_the_row_from_completion(self):
+        """Same loop as the completing case, but a human touched the row first."""
+        page_id = self.seed_customer_page("alpha")
+        self.h.config["customers"][0]["page_id"] = page_id
+        alpha = mailbuilder.CUSTOMERS["alpha"]
+        self.folders["INBOX"] = [build_inbound(1, alpha, "Need pricing",
+                                               "<alpha-8@alpha-trading.example>")]
+        packet, state = self.h.scan(commit=True)
+        _, results = self.h.apply(packet, state, commit=True)
+        task_id = results["tasks"][0]["page_id"]
+        identity = results["tasks"][0]["identity"]
+        self.assertTrue(state_module.agent_write_at(state, identity),
+                        "the tool must record when it wrote")
+
+        # The human opens Notion and edits the row after that write.
+        self.h.notion.touch(task_id)
+
+        self.folders["&XfJT0ZAB-"] = [build_outbound(
+            51, "buyer@alpha-trading.example", "Re: Need pricing",
+            "<reply-3@company.example>", in_reply_to="<alpha-8@alpha-trading.example>")]
+        packet2, state2 = self.h.scan(commit=True)
+        summary, results2 = self.h.apply(packet2, state2, commit=True)
+        self.assertEqual(results2["completions"][0]["action"], "protected")
+        self.assertTrue(results2["completions"][0]["protection"]["protected"])
+        self.assertEqual(self.h.notion.page_status(task_id), "Todo",
+                         "a human-edited row must not be flipped to Done")
 
     def test_completed_task_leaves_the_open_list(self):
         """Acceptance: a completed task exits the to-do view (status != todo)."""
@@ -974,6 +1003,179 @@ class JudgmentLoop(unittest.TestCase):
         self.assertEqual(len(results["rejected"]), 1)
 
 
+class TieredDedupe(unittest.TestCase):
+    """Three-way dedupe: same / near (held for a human) / new.
+
+    Ported from a pipeline that ran against real data; the point of the
+    middle tier is that a candidate is neither duplicated nor lost.
+    """
+
+    ROWS = [
+        {"id": "row-1", "title": "Alpha Trading｜核价并回复",
+         "identities": set(), "customer": "alpha"},
+        {"id": "row-2", "title": "Alpha Trading｜确认打样时间",
+         "identities": set(), "customer": "alpha"},
+    ]
+
+    def classify(self, title, customer="alpha", rows=None, policy=None):
+        return dedupe_module.classify(self.ROWS if rows is None else rows,
+                                      title, identity=None, customer=customer,
+                                      policy=policy or {})
+
+    def test_tiers_split_same_near_and_new(self):
+        same = self.classify("Alpha Trading｜核价后回复客户")
+        near = self.classify("Alpha Trading｜安排样品寄送")
+        new = self.classify("Bravo Industries｜确认样品寄送地址", customer="bravo")
+        self.assertEqual((same["kind"], near["kind"], new["kind"]),
+                         ("same", "near", "new"))
+        self.assertGreaterEqual(same["score"], 0.72)
+        self.assertGreaterEqual(near["score"], 0.42)
+        self.assertLess(near["score"], 0.72, "near must stay below refresh_ratio")
+        self.assertEqual(near["row"]["id"], "row-1",
+                         "the held candidate names the row it resembles")
+        self.assertLess(new["score"], 0.42)
+
+    def test_short_row_title_does_not_swallow_a_longer_candidate(self):
+        """Regression: max()-based coverage scored this pair 1.0 (swallowed)."""
+        rows = [{"id": "stub", "title": "Alpha", "identities": set(),
+                 "customer": "alpha"}]
+        verdict = self.classify("Alpha Trading｜核价并回复", rows=rows)
+        self.assertEqual(verdict["kind"], "new", verdict["reason"])
+        self.assertLess(verdict["score"], 0.30)
+
+    def test_identity_match_wins_over_fuzzy_and_scores_exact(self):
+        rows = [{"id": "id-1", "title": "毫无关系的另一件事",
+                 "identities": {"alpha-7"}, "customer": "alpha"}]
+        verdict = dedupe_module.classify(rows, "另一件事", identity="alpha-7",
+                                         customer="alpha", policy={})
+        self.assertEqual(verdict["kind"], "exact")
+        self.assertEqual(verdict["score"], 1.0)
+        self.assertEqual(verdict["row"]["id"], "id-1")
+
+    def test_customer_unique_floor_matches_the_lone_row(self):
+        rows = [{"id": "only", "title": "Alpha Trading｜核价并回复",
+                 "identities": set(), "customer": "alpha"}]
+        verdict = self.classify("Alpha Trading｜安排样品寄送", rows=rows)
+        self.assertEqual(verdict["kind"], "same", verdict["reason"])
+        self.assertLess(verdict["score"], 0.72,
+                        "below refresh_ratio: only the floor made this match")
+
+    def test_thresholds_are_configurable(self):
+        strict = self.classify("Alpha Trading｜核价后回复客户",
+                               policy={"dedupe": {"refresh_ratio": 0.95}})
+        self.assertEqual(strict["kind"], "near",
+                         "a stricter refresh_ratio must hold this candidate")
+
+    def test_exact_mode_keeps_the_legacy_binary_dedupe(self):
+        verdict = self.classify("Alpha Trading｜核价后回复客户",
+                                policy={"dedupe": {"mode": "exact"}})
+        self.assertEqual(verdict["kind"], "new",
+                         "exact mode must not use fuzzy matching at all")
+
+    def test_near_candidate_is_held_and_writes_nothing(self):
+        """End-to-end: a near candidate creates no row and is reported."""
+        notion = make_notion()
+        notion.create_page(notion.data_source_id, {
+            "任务名称": {"title": [{"type": "text", "text": {"content": "Alpha Trading｜核价并回复"}}]},
+            "任务标识": {"rich_text": [{"type": "text", "text": {"content": "alpha-1;"}}]},
+        }, children=[])
+        config = {"customers": [{"key": "alpha", "display_name": "Alpha Trading"}],
+                  "notion": {"properties": {"title": "任务名称", "status": "状态",
+                                            "key": "任务标识"},
+                             "status_map": {"todo": "Todo", "in_progress": "In progress",
+                                            "done": "Done", "archived": "Archived"}},
+                  "policy": {"timezone": "+08:00", "body_fetch_limit_per_run": 60}}
+        existing = tasks_module.load_existing(notion, notion.data_source_id)
+        candidate = {"identity": "alpha-2", "customer_key": "alpha",
+                     "customer_display": "Alpha Trading",
+                     "title": "Alpha Trading｜安排样品寄送",
+                     "action": "安排样品", "completion_standard": "样品已寄出",
+                     "evidence": "客户来信", "source_locator": "https://www.notion.so/x",
+                     "status": "Todo"}
+        pages_before = len(notion.pages)
+        writes_before = notion.write_calls()   # the setup page create, nothing else
+        outcome = tasks_module.apply_candidate(notion, config, {}, {}, candidate,
+                                               existing, set(), commit=True)
+        self.assertEqual(outcome["action"], "needs_review")
+        self.assertEqual(outcome["match"]["kind"], "near")
+        self.assertEqual(outcome["matched_title"], "Alpha Trading｜核价并回复")
+        self.assertEqual(len(notion.pages), pages_before, "held candidate wrote a page")
+        self.assertEqual(notion.write_calls(), writes_before,
+                         "held candidate wrote to Notion")
+
+
+class HumanEditProtection(unittest.TestCase):
+    """A row a human edited after our last write is never overwritten."""
+
+    agent_ts = "2026-10-20T10:00:00+08:00"      # 02:00Z
+    later_ts = "2026-10-20T12:00:00.000Z"       # 12:00Z
+    earlier_ts = "2026-10-20T01:00:00.000Z"     # 01:00Z
+
+    def test_human_touched_semantics(self):
+        self.assertFalse(protection_module.human_touched(None, None))
+        self.assertFalse(protection_module.human_touched(None, self.agent_ts))
+        # no record of our own write -> no proof we may overwrite
+        self.assertTrue(protection_module.human_touched(self.later_ts, None))
+        self.assertTrue(protection_module.human_touched(self.later_ts, self.agent_ts))
+        self.assertFalse(protection_module.human_touched(self.earlier_ts, self.agent_ts))
+        # unparseable timestamp -> fails safe
+        self.assertTrue(protection_module.human_touched("not-a-time", self.agent_ts))
+
+    def test_later_of_prefers_the_notion_stamp(self):
+        self.assertEqual(protection_module.later_of(self.agent_ts, self.later_ts),
+                         self.later_ts)
+        self.assertEqual(protection_module.later_of(self.agent_ts, None),
+                         self.agent_ts)
+
+    def test_decide_reports_and_can_be_disabled(self):
+        page = {"last_edited_time": self.later_ts}
+        record = {"lastWriteAt": self.agent_ts}
+        guard = protection_module.decide(page, record, {})
+        self.assertTrue(guard["protected"])
+        self.assertEqual(guard["pageEditedAt"], self.later_ts)
+        self.assertEqual(guard["agentWroteAt"], self.agent_ts)
+        off = protection_module.decide(page, record, {"protect_human_edits": False})
+        self.assertFalse(off["protected"])
+        self.assertFalse(off["checked"])
+
+
+class UnrecognizedInput(unittest.TestCase):
+    """An input we cannot read is never reported as "nothing to do"."""
+
+    def test_shape_problems(self):
+        self.assertIsNone(plan_module.packet_shape_problem({"new_messages": []}))
+        self.assertIsNotNone(plan_module.packet_shape_problem({"messages": []}))
+        self.assertIsNotNone(plan_module.packet_shape_problem([]))
+        self.assertIsNone(plan_module.suggestions_shape_problem({"tasks": []}))
+        self.assertIsNotNone(plan_module.suggestions_shape_problem({"items": []}))
+
+    def test_suggest_refuses_a_foreign_packet_instead_of_returning_zero(self):
+        from nextmove import cli
+        harness = LoopHarness(mailbuilder.standard_folders())
+        self.addCleanup(harness.close)
+        foreign = Path(harness.tmp) / "foreign.json"
+        foreign.write_text(json.dumps({"messages": [{"subject": "real work"}]},
+                                      ensure_ascii=False), encoding="utf-8")
+        code, report = _run_cli(cli, harness, ["--config", str(harness.config_path),
+                                               "suggest", "--input", str(foreign)],
+                                expect_exit=1)
+        self.assertEqual(report["status"], "PACKET_UNRECOGNIZED")
+        self.assertFalse((Path(harness.tmp) / "suggestions.json").exists(),
+                         "an unreadable packet must not produce an empty suggestion file")
+
+    def test_apply_refuses_a_foreign_suggestions_file(self):
+        from nextmove import cli
+        harness = LoopHarness(mailbuilder.standard_folders())
+        self.addCleanup(harness.close)
+        foreign = Path(harness.tmp) / "not-suggestions.json"
+        foreign.write_text(json.dumps({"items": []}, ensure_ascii=False),
+                           encoding="utf-8")
+        code, report = _run_cli(cli, harness, ["--config", str(harness.config_path),
+                                               "apply", "--input", str(foreign)],
+                                expect_exit=1)
+        self.assertEqual(report["status"], "INPUT_UNRECOGNIZED")
+
+
 class CliSmoke(unittest.TestCase):
     """The CLI runs end to end against fakes: doctor/check/status shapes."""
 
@@ -1106,7 +1308,8 @@ def main():
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
     for case in (PlanUnit, ReadOnlyContract, LoopEndToEnd, ConfigUnit, TasksUnit,
-                 JudgmentUnit, JudgmentLoop, CliSmoke):
+                 JudgmentUnit, JudgmentLoop, TieredDedupe, HumanEditProtection,
+                 UnrecognizedInput, CliSmoke):
         suite.addTests(loader.loadTestsFromTestCase(case))
     runner = unittest.TextTestRunner(verbosity=2, stream=sys.stdout)
     result = runner.run(suite)

@@ -35,6 +35,7 @@ from pathlib import Path
 from . import config as config_module
 from . import judgment as judgment_module
 from . import loop, mailcore, state as state_module, tasks as tasks_module
+from . import plan as plan_module
 from .notion import NotionClient, NotionError
 
 EXIT_OK, EXIT_FAIL, EXIT_CONFIG, EXIT_CONNECTION = 0, 1, 2, 3
@@ -360,6 +361,13 @@ def cmd_suggest(args):
         _print({"status": "INPUT_MISSING", "expected": str(packet_path)})
         return EXIT_FAIL
     packet = json.loads(packet_path.read_text(encoding="utf-8"))
+    problem = plan_module.packet_shape_problem(packet)
+    if problem:
+        # A foreign or renamed file is never "no new work" — report it loud.
+        _print({"status": "PACKET_UNRECOGNIZED", "input": str(packet_path),
+                "error": problem,
+                "note": "没有按扫描包读取；未产生任何建议，也未写入任何内容"})
+        return EXIT_FAIL
     summary = loop.suggest_candidates(config, packet, state)
     out = packet_path.parent / "suggestions.json"
     out.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -380,6 +388,12 @@ def cmd_apply(args):
                 "hint": "point --input at a suggestions.json produced by `suggest`"})
         return EXIT_FAIL
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    problem = plan_module.suggestions_shape_problem(summary)
+    if problem:
+        _print({"status": "INPUT_UNRECOGNIZED", "input": str(summary_path),
+                "error": problem,
+                "note": "未按建议文件读取；未写入任何内容"})
+        return EXIT_FAIL
     commit = bool(args.commit)
     client, _ = _client(config, dry_run=not commit)
     try:

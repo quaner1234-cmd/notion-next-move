@@ -146,6 +146,21 @@ def upsert_task(state, identity, record):
     return state["tasks"][identity]
 
 
+def record_task_write(state, identity, at=None):
+    """Remember when this tool last wrote to the task's Notion page.
+
+    Human-edit protection compares the page's ``last_edited_time`` against
+    this stamp: anything the human changed after it wins.
+    """
+    if not identity:
+        return None
+    return upsert_task(state, identity, {"lastWriteAt": at or _now()})
+
+
+def agent_write_at(state, identity):
+    return (state.get("tasks", {}).get(identity) or {}).get("lastWriteAt")
+
+
 def add_pending(state, entry):
     """Queue one item for human review (unknown sender, no customer mapping)."""
     key = (entry.get("message_id") or entry.get("uid"))

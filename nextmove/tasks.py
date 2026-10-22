@@ -7,9 +7,9 @@ onto it, and refuses to write when something does not line up.
 from __future__ import annotations
 
 import re
-import unicodedata
 
 from . import plan as plan_module
+from . import dedupe as dedupe_module
 from .notion import heading, link_bullet, paragraph, rich_text
 
 STATUS_GROUP_DEFAULT = {"todo": "Todo", "in_progress": "In progress",
@@ -18,11 +18,6 @@ STATUS_GROUP_DEFAULT = {"todo": "Todo", "in_progress": "In progress",
 
 class TaskError(Exception):
     """A task operation cannot proceed safely."""
-
-
-def _norm(value):
-    text = unicodedata.normalize("NFKC", str(value or ""))
-    return re.sub(r"\s+", " ", text).strip().casefold()
 
 
 def discover_properties(client, data_source_id):
@@ -130,29 +125,70 @@ def load_existing(client, data_source_id):
     return client.query_data_source(data_source_id, payload={})
 
 
+def _property_text(value):
+    """Plain text of a Notion property value (rich_text list, str or None)."""
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return "".join(x.get("plain_text", "") for x in value)
+    if isinstance(value, dict):
+        return str(value.get("name") or value.get("plain_text") or "")
+    return str(value)
+
+
+def existing_rows(existing_pages, mapping=None):
+    """Reduce live Notion pages to the plain rows the dedupe module compares.
+
+    Keeping this translation here is what lets ``dedupe`` stay pure (no
+    Notion shapes, no network) and therefore testable offline.
+    """
+    rows = []
+    for page in existing_pages:
+        key_property = (mapping or {}).get("key")
+        customer_property = (mapping or {}).get("customer")
+        rows.append({
+            "id": page.get("id"),
+            "title": page_title(page),
+            "identities": (_rich_text_tokens(page_property(page, key_property))
+                           if key_property else set()),
+            "customer": (_property_text(page_property(page, customer_property))
+                         if customer_property else None),
+            "page": page,
+        })
+    return rows
+
+
+def classify_duplicate(existing_pages, config, candidate, mapping):
+    """Three-way verdict: ``exact`` / ``same`` / ``near`` / ``new``.
+
+    Only ``exact`` and ``same`` count as a real duplicate. ``near`` is held
+    for a human: it is neither created (no duplicate rows) nor swallowed
+    (it is reported with its score and the row it resembles).
+    """
+    rows = existing_rows(existing_pages, mapping)
+    return dedupe_module.classify(rows, candidate.get("title"),
+                                  identity=candidate.get("identity"),
+                                  customer=candidate.get("customer_key"),
+                                  policy=config.get("policy") or {})
+
+
 def find_duplicate(existing_pages, config, candidate, mapping):
     """Find an existing task that already represents this work.
 
     Priority:
       1. the stable identity key, when a key property is configured (exact
          token match on the property's text or the page title);
-      2. normalized title equality when the key property is unconfigured.
+      2. normalized title equality when the key property is unconfigured;
+      3. fuzzy similarity at or above ``policy.dedupe.refresh_ratio``.
 
-    Returns the matching page dict or None.
+    A candidate that is only *similar* (between ``hold_ratio`` and
+    ``refresh_ratio``) is **not** a duplicate: it is held for a human by
+    :func:`classify_duplicate` instead, so it can neither duplicate an
+    existing row nor disappear.
     """
-    key = candidate.get("identity")
-    key_property = mapping.get("key")
-    if key and key_property:
-        for page in existing_pages:
-            raw = page_property(page, key_property)
-            tokens = _rich_text_tokens(raw)
-            if key in tokens:
-                return page
-    wanted = _norm(candidate.get("title"))
-    if wanted:
-        for page in existing_pages:
-            if _norm(page_title(page)) == wanted:
-                return page
+    verdict = classify_duplicate(existing_pages, config, candidate, mapping)
+    if verdict["kind"] in ("exact", "same") and verdict.get("row"):
+        return verdict["row"].get("page")
     return None
 
 
@@ -233,6 +269,16 @@ def apply_candidate(client, config, mapping, kinds, candidate, existing_pages,
               "action": None, "problems": problems, "page_id": None}
     if problems:
         result["action"] = "rejected"
+        return result
+    verdict = classify_duplicate(existing_pages, config, candidate, mapping)
+    result["match"] = {"kind": verdict["kind"], "score": verdict["score"],
+                       "reason": verdict["reason"]}
+    if verdict["kind"] == "near":
+        # Held for a human: not created (no duplicate row) and not dropped
+        # (it is reported with the row it resembles and its score).
+        result["action"] = "needs_review"
+        result["matched_page_id"] = (verdict.get("row") or {}).get("id")
+        result["matched_title"] = (verdict.get("row") or {}).get("title")
         return result
     duplicate = find_duplicate(existing_pages, config, candidate, mapping)
     if duplicate:
